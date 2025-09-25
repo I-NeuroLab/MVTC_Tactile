@@ -149,7 +149,7 @@ def main(args):
     modellist = ['TacNet']
     for mdl_idx in range(0,1):
         for type_idx in range(2,3):
-            for mode_idx in range(0,1):
+            for mode_idx in range(1,2):
                 for actv_idx in range(1,2):
                     print("time = {}".format(type_idx))
                     save_dir = (Path(__file__).resolve().parent / "log")
@@ -160,7 +160,7 @@ def main(args):
                     torch.manual_seed(args.seed)
                     torch.cuda.manual_seed(args.seed)
                     args.epochs = 1000
-                    args.batch_size = 128 #64
+                    args.batch_size = 64 #64
                     args.lr = 5e-4
                     nclass = 1
                     args.pool_stride = 32 #32
@@ -230,7 +230,7 @@ def main(args):
                             n_chans = X_train.shape[1]
                             model_kwargs = dict(
                                 in_ch=n_chans, fs=1250.0, taps=129,
-                                branch_out_ch=8, pool_stride=args.pool_stride, K=args.K,
+                                branch_out_ch=32, pool_stride=args.pool_stride, K=args.K,
                                 d_model=128, nhead=4, num_layers=2, dim_feedforward=256,
                                 dropout=0.3, mode=args.mode,
                                 output_activation=args.output_activation, output_minmax=(0.0, 4.0), n_class=1
@@ -286,10 +286,10 @@ def main(args):
                                 if early_stopper.early_stop:
                                     print("Early stopping triggered at epoch", epoch + 1)
                                     break
-                    
-                            ckpt_path = save_dir / f"Best_{modelname}_{CV_cnt}_{type_idx}_{args.mode}_{args.output_activation}_bat128.pt"
+                        
+                            ckpt_path = save_dir / f"Best_{modelname}_{CV_cnt}_{type_idx}_{args.mode}_{args.output_activation}.pt"
                             torch.save({"state_dict": best_model_state, "model_kwargs": model_kwargs}, ckpt_path)
-
+                            
                             del model
                             model = TactileRoughnessHybridNet(**model_kwargs).to(devices)
                             model.load_state_dict({k: v.to(devices) for k, v in best_model_state.items()})
@@ -316,7 +316,7 @@ def main(args):
                             
                             # Save attention (mean over heads & batches)
                             attn_mean_layers, attn_meta = compute_mean_attention_over_loader(model, test_dataloader, devices, mode=args.mode)
-                            attn_path = save_dir / f"Attn_{modelname}_{CV_cnt}_{type_idx}_{args.mode}_{args.output_activation}_bat128.mat"
+                            attn_path = save_dir / f"Attn_{modelname}_{CV_cnt}_{type_idx}_{args.mode}_{args.output_activation}.mat"
                             io.savemat(str(attn_path), {
                                 "attn_mean_layers": attn_mean_layers,  # (L,S,S)
                                 "attn_L": attn_mean_layers.shape[0],
@@ -324,7 +324,7 @@ def main(args):
                                 "mode": args.mode
                             })
                             
-                            baseprefix = f"Attn_{modelname}_{CV_cnt}_{type_idx}_{args.mode}_{args.output_activation}_bat128"
+                            baseprefix = f"Attn_{modelname}_{CV_cnt}_{type_idx}_{args.mode}_{args.output_activation}"
                             save_per_token_importance(save_dir, baseprefix, attn_mean_layers, attn_meta, model_kwargs, T=int(X_train.shape[2]))
 
                             savedict = {
@@ -358,13 +358,13 @@ def main(args):
                                 te_acc            
                             ]
                             
-                            hist_path = save_dir / f'History_{modelname}_{CV_cnt}_{type_idx}_{args.mode}_{args.output_activation}_bat128.csv'
-                            reg_path  = save_dir / f'Reg_{modelname}_{CV_cnt}_{type_idx}_{args.mode}_{args.output_activation}_bat128.mat'
+                            hist_path = save_dir / f'History_{modelname}_{CV_cnt}_{type_idx}_{args.mode}_{args.output_activation}.csv'
+                            reg_path  = save_dir / f'Reg_{modelname}_{CV_cnt}_{type_idx}_{args.mode}_{args.output_activation}.mat'
                             history.to_csv(hist_path, index=False)
                             io.savemat(str(reg_path), savedict)
-                            CV_cnt = CV_cnt+1
                             del history, savedict
                             print("\tSavedir", save_dir)
+                            CV_cnt = CV_cnt+1
     
 if __name__ == '__main__':
 
