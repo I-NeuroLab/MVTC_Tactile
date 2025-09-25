@@ -144,234 +144,318 @@ def save_per_token_importance(save_dir_path: Path, baseprefix: str,
         "fs": fs,
         "T": int(T),
     })
-    
+
+from typing import Dict, Tuple, List
+from decimal import Decimal, ROUND_HALF_UP
+import numpy as np
+
+# numpy 스칼라를 파이썬 기본형으로 캐스팅
+def _to_py(x):
+    if isinstance(x, np.generic):   # np.float32, np.int32 등
+        return x.item()
+    return x
+
+_Q = Decimal("0.1")  # 0.1 단위로 양자화
+
+def make_equal_bands(low: float, high: float, n) -> List[Tuple[float, float]]:
+    """
+    [low, high]를 n등분하여 (start, end) 밴드 목록을 반환.
+    모든 경계는 소수 첫째자리까지 반올림되어 0.1 단위로 고정됨.
+    n이 numpy.int32 등이어도 동작.
+    """
+    low = _to_py(low)
+    high = _to_py(high)
+    n = int(_to_py(n))  # numpy.int32 -> int
+
+    if n <= 0:
+        raise ValueError("n must be >= 1")
+    if not (low < high):
+        raise ValueError("low must be < high")
+
+    L = Decimal(str(low))
+    H = Decimal(str(high))
+    step = (H - L) / Decimal(n)
+
+    # 경계 생성 + 0.1 단위 양자화(반올림)
+    edges = [(L + step * i).quantize(_Q, rounding=ROUND_HALF_UP) for i in range(n + 1)]
+
+    # 혹시 모를 누적 반올림 오차를 시작/끝에서 보정
+    edges[0]  = Decimal(str(low)).quantize(_Q, rounding=ROUND_HALF_UP)
+    edges[-1] = Decimal(str(high)).quantize(_Q, rounding=ROUND_HALF_UP)
+
+    # (start, end) 밴드로 변환 (float로 반환)
+    bands = [(float(edges[i]), float(edges[i + 1])) for i in range(n)]
+    return bands
+
+
+def make_fbank_index(
+    fbank_n,
+    bounds_per_receptor: Dict[str, Tuple[float, float]],
+) -> Dict[str, List[Tuple[float, float]]]:
+    """
+    receptor별 (low, high)를 받아 n등분 밴드를 생성.
+    모든 값은 소수 첫째자리까지만 허용.
+    """
+    fbank_n = int(_to_py(fbank_n))
+    fbank_custom: Dict[str, List[Tuple[float, float]]] = {}
+
+    for name, (low, high) in bounds_per_receptor.items():
+        bands = make_equal_bands(low, high, fbank_n)
+
+        # 시작/끝을 한 번 더 확정적으로 보정
+        if bands:
+            bands[0]  = (float(Decimal(str(low)).quantize(_Q, rounding=ROUND_HALF_UP)), bands[0][1])
+            bands[-1] = (bands[-1][0], float(Decimal(str(high)).quantize(_Q, rounding=ROUND_HALF_UP)))
+
+        fbank_custom[name] = bands
+
+    return fbank_custom
+
+
+type_list = np.array([2])
+mode_list = np.array([0, 1, 2])
+fbank_list = np.array([7])
+#fbank_list = np.array([1,3,5,7])
+
 def main(args):
     modellist = ['TacNet']
     for mdl_idx in range(0,1):
-        for type_idx in range(2,3):
-            for mode_idx in range(2,3):
-                for actv_idx in range(1,2):
-                    print("time = {}".format(type_idx))
-                    save_dir = (Path(__file__).resolve().parent / "log")
-                    save_dir.mkdir(parents=True, exist_ok=True)
-                    modelname = modellist[mdl_idx]
-                    random.seed(args.seed)
-                    np.random.seed(args.seed)
-                    torch.manual_seed(args.seed)
-                    torch.cuda.manual_seed(args.seed)
-                    args.epochs = 1000
-                    args.batch_size = 64 #64
-                    args.lr = 5e-4
-                    nclass = 1
-                    args.pool_stride = 32 #32
-                    args.K = 1 #1
-                    args.use_aug = False
-                    args.share_subband_conv = False
-                    args.fbank_custom = None
-                    args.fbank_n = 3
-                    #args.fbank_custom = {"RA2": [(64.0, 120.0), (120.0, 220.0), (220.0, 400.0)]}
-                    
-                    if actv_idx == 0:
-                        args.output_activation = "identity"
-                    elif actv_idx == 1:
-                        args.output_activation = "scaled_sigmoid"
-                    else:
-                        args.output_activation = "scaled_tanh"
-                        
-                    if mode_idx == 0:
-                        args.mode = "time"
-                    elif mode_idx == 1:
-                        args.mode = "branch"
-                    else:
-                        args.mode = "hybrid"
-                        
-                    devices = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                    
-                    CV_cnt = 0
-                    for rep in range(5):
-                        Temp_data = TacDataset_save(args.data_dir,
-                                                    save_dir,
-                                                    args.seed,
-                                                    type_idx,
-                                                    zscore_mode="per_channel_global",
-                                                    shuffle_arrays=False,
-                                                    save_stats=True,
-                                                    n_repeats=5,
-                                                    repeat_idx=rep,
-                                                    outer_splits=5,
-                                                    inner_splits=4,
-                                                    splits_root=save_dir)
-                        
-                        for temp in zip(Temp_data):
-                            history = pd.DataFrame(columns=[
-                                'epoch', 'tr_loss', 'val_loss',
-                                'tr_acc', 'val_acc',
-                                'model_updated',
-                                'te_loss', 'te_acc'
-                            ])
+        for fb_idx in fbank_list:
+            for type_idx in type_list:
+                for mode_idx in mode_list:
+                    for actv_idx in range(1,2):
+                        print("time = {}".format(type_idx))
+                        save_dir = (Path(__file__).resolve().parent / "log")
+                        save_dir.mkdir(parents=True, exist_ok=True)
+                        modelname = modellist[mdl_idx]
+                        random.seed(args.seed)
+                        np.random.seed(args.seed)
+                        torch.manual_seed(args.seed)
+                        torch.cuda.manual_seed(args.seed)
+                        args.epochs = 1000
+                        args.batch_size = 64 #64
+                        args.lr = 5e-4
+                        nclass = 1
+                        args.pool_stride = 32 #32
+                        args.K = 1 #1
+                        args.use_aug = False
+                        args.share_subband_conv = False
+                        args.fbank_n = fb_idx
+                        fbank_bounds = {
+                            "SA1": (2.0, 32.0),
+                            "SA2": (0.0, 8.0),
+                            "RA1": (5.0, 64.0),
+                            "RA2": (64.0, 400.0),
+                        }
+                        args.fbank_custom = make_fbank_index(fbank_n=args.fbank_n,
+                                                            bounds_per_receptor=fbank_bounds)
+                        """
+                        args.fbank_custom2 = {"SA1": [(2.0, 8.0), (8.0, 14.0), (14.0, 20.0), (20.0, 26.0), (26.0, 32.0)],
+                                             "SA2": [(0.0, 1.6), (1.6, 3.2), (3.2, 4.8), (4.8, 6.4), (6.4, 8.0)],
+                                             "RA1": [(8.0, 19.2), (19.2, 30.4), (30.4, 41.6), (41.6, 52.8), (52.8, 64.0)],
+                                             "RA2": [(64.0, 131.2), (131.2, 198.4), (198.4, 265.6), (265.6, 332.8), (332.8, 400.0)]}
+                        """
+                        if actv_idx == 0:
+                            args.output_activation = "identity"
+                        elif actv_idx == 1:
+                            args.output_activation = "scaled_sigmoid"
+                        else:
+                            args.output_activation = "scaled_tanh"
                             
-                            X_train, Y_train, X_val, Y_val, X_test, Y_test = temp[0]
-                            if type_idx == 3 or type_idx == 4 or type_idx == 5:
-                                X_train = X_train
-                                X_val = X_val
-                                X_test = X_test
-                            else:
-                                X_train = X_train.unsqueeze(1)
-                                X_val = X_val.unsqueeze(1)
-                                X_test = X_test.unsqueeze(1)
-                    
-                            train_dataset = TensorDataset(X_train, Y_train)
-                            val_dataset = TensorDataset(X_val, Y_val)
-                            test_dataset = TensorDataset(X_test, Y_test)
-                    
-                            train_dataloader = DataLoader(
-                                train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-                            val_dataloader = DataLoader(
-                                val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
-                            test_dataloader = DataLoader(
-                                test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
-                    
-                            n_chans = X_train.shape[1]
-                            model_kwargs = dict(
-                                in_ch=n_chans, fs=1250.0, taps=129,
-                                branch_out_ch=8, pool_stride=args.pool_stride, K=args.K,
-                                d_model=128, nhead=4, num_layers=2, dim_feedforward=256,
-                                dropout=0.3, mode=args.mode,
-                                output_activation=args.output_activation, output_minmax=(0.0, 4.0), n_class=1,
-                                fbank_n=getattr(args, "fbank_n", 3),
-                                fbank_custom=getattr(args, "fbank_custom", None),
-                                share_subband_conv=getattr(args, "share_subband_conv", False),
-                            )
-                            model = TactileRoughnessHybridNet(**model_kwargs).to(devices)
-            
-                            optimizer = torch.optim.AdamW(
-                                model.parameters(), lr=args.lr, weight_decay=5e-4)
-                            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                                optimizer, T_max=args.epochs)
-                    
-                            # Track best results for this fold
-                            best_loss = float('inf')
-                            best_model_state = None
+                        if mode_idx == 0:
+                            args.mode = "time"
+                        elif mode_idx == 1:
+                            args.mode = "branch"
+                        else:
+                            args.mode = "hybrid"
                             
-                            # Training loop for this fold
-                            early_stopper = EarlyStopping(patience=30, delta=0.001)
-                            for epoch in range(args.epochs):
-                                tr_loss, _, tr_acc, _, tr_R = train_one_epoch(
-                                    model, train_dataloader, optimizer,
-                                    aug_enabled=args.use_aug, aug_mode="append", append_ratio=0.5)
-                                val_loss, _, val_acc, _, val_R = validation(
+                        devices = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                        
+                        CV_cnt = 0
+                        for rep in range(5):
+                            Temp_data = TacDataset_save(args.data_dir,
+                                                        save_dir,
+                                                        args.seed,
+                                                        type_idx,
+                                                        zscore_mode="per_channel_global",
+                                                        shuffle_arrays=False,
+                                                        save_stats=True,
+                                                        n_repeats=5,
+                                                        repeat_idx=rep,
+                                                        outer_splits=5,
+                                                        inner_splits=4,
+                                                        splits_root=save_dir)
+                            
+                            for temp in zip(Temp_data):
+                                history = pd.DataFrame(columns=[
+                                    'epoch', 'tr_loss', 'val_loss',
+                                    'tr_acc', 'val_acc',
+                                    'model_updated',
+                                    'te_loss', 'te_acc'
+                                ])
+                                
+                                X_train, Y_train, X_val, Y_val, X_test, Y_test = temp[0]
+                                if type_idx == 3 or type_idx == 4 or type_idx == 5:
+                                    X_train = X_train
+                                    X_val = X_val
+                                    X_test = X_test
+                                else:
+                                    X_train = X_train.unsqueeze(1)
+                                    X_val = X_val.unsqueeze(1)
+                                    X_test = X_test.unsqueeze(1)
+                        
+                                train_dataset = TensorDataset(X_train, Y_train)
+                                val_dataset = TensorDataset(X_val, Y_val)
+                                test_dataset = TensorDataset(X_test, Y_test)
+                        
+                                train_dataloader = DataLoader(
+                                    train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+                                val_dataloader = DataLoader(
+                                    val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+                                test_dataloader = DataLoader(
+                                    test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+                        
+                                n_chans = X_train.shape[1]
+                                model_kwargs = dict(
+                                    in_ch=n_chans, fs=1250.0, taps=129,
+                                    branch_out_ch=32, pool_stride=args.pool_stride, K=args.K,
+                                    d_model=128, nhead=4, num_layers=2, dim_feedforward=256,
+                                    dropout=0.3, mode=args.mode,
+                                    output_activation=args.output_activation, output_minmax=(0.0, 4.0), n_class=1,
+                                    fbank_n=getattr(args, "fbank_n", 3),
+                                    fbank_custom=getattr(args, "fbank_custom", None),
+                                    share_subband_conv=getattr(args, "share_subband_conv", False),
+                                )
+                                model = TactileRoughnessHybridNet(**model_kwargs).to(devices)
+                
+                                optimizer = torch.optim.AdamW(
+                                    model.parameters(), lr=args.lr, weight_decay=5e-4)
+                                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                                    optimizer, T_max=args.epochs)
+                        
+                                # Track best results for this fold
+                                best_loss = float('inf')
+                                best_model_state = None
+                                
+                                # Training loop for this fold
+                                early_stopper = EarlyStopping(patience=30, delta=0.001)
+                                for epoch in range(args.epochs):
+                                    tr_loss, _, tr_acc, _, tr_R = train_one_epoch(
+                                        model, train_dataloader, optimizer,
+                                        aug_enabled=args.use_aug, aug_mode="append", append_ratio=0.5)
+                                    val_loss, _, val_acc, _, val_R = validation(
+                                        model, val_dataloader)
+                                    torch.cuda.empty_cache()
+                        
+                                    print("\tEpoch_tr", epoch + 1, f"\tAverage Loss: {tr_loss:.4f}",
+                                          f"\ttr_rmse: {tr_acc:.4f}", f"\ttr_R^2: {tr_R:.4f}")
+                                    
+                                    print("\tEpoch_val", epoch + 1, f"\tAverage Loss: {val_loss:.4f}",
+                                          f"\tval_rmse: {val_acc:.4f}", f"\tval_R^2: {val_R:.4f}")
+                                    
+                                    scheduler.step()
+                        
+                                    model_updated = False
+                                    if best_loss > val_loss:
+                                        best_loss = val_loss
+                                        best_model_state = copy.deepcopy(model.state_dict())
+                                        model_updated = True
+                                        print("Model updated")
+                        
+                                    history.loc[len(history)] = [
+                                        epoch + 1,
+                                        tr_loss,
+                                        val_loss,
+                                        tr_acc,
+                                        val_acc,
+                                        model_updated,
+                                        0,
+                                        0
+                                    ]
+                        
+                                    early_stopper(val_loss)
+                                    if early_stopper.early_stop:
+                                        print("Early stopping triggered at epoch", epoch + 1)
+                                        break
+                        
+                                ckpt_path = save_dir / f"Best_{modelname}_{CV_cnt}_{type_idx}_{args.mode}_{args.output_activation}_fb{args.fbank_n}.pt"
+                                torch.save({"state_dict": best_model_state, "model_kwargs": model_kwargs}, ckpt_path)
+    
+                                del model
+                                model = TactileRoughnessHybridNet(**model_kwargs).to(devices)
+                                model.load_state_dict({k: v.to(devices) for k, v in best_model_state.items()})
+                                            
+                                tr_loss, tr_pred, tr_acc, tr_true, tr_R2 = validation(
+                                    model, train_dataloader)
+                                val_loss, val_pred, val_acc, val_true, val_R2 = validation(
                                     model, val_dataloader)
+                                te_loss, te_pred, te_acc, te_true, te_R2 = validation(
+                                    model, test_dataloader)
                                 torch.cuda.empty_cache()
-                    
-                                print("\tEpoch_tr", epoch + 1, f"\tAverage Loss: {tr_loss:.4f}",
-                                      f"\ttr_rmse: {tr_acc:.4f}", f"\ttr_R^2: {tr_R:.4f}")
                                 
-                                print("\tEpoch_val", epoch + 1, f"\tAverage Loss: {val_loss:.4f}",
-                                      f"\tval_rmse: {val_acc:.4f}", f"\tval_R^2: {val_R:.4f}")
+                                print( f"\ttr_loss: {tr_loss:.4f}",
+                                      f"\ttr_rmse: {tr_acc:.4f}",
+                                      f"\ttr_R^2: {tr_R2:.4f}")
                                 
-                                scheduler.step()
-                    
-                                model_updated = False
-                                if best_loss > val_loss:
-                                    best_loss = val_loss
-                                    best_model_state = copy.deepcopy(model.state_dict())
-                                    model_updated = True
-                                    print("Model updated")
-                    
+                                print( f"\tval_loss: {val_loss:.4f}",
+                                      f"\tval_rmse: {val_acc:.4f}",
+                                      f"\tval_R^2: {val_R2:.4f}")
+                                
+                                print( f"\tte_loss: {te_loss:.4f}",
+                                      f"\tte_rmse: {te_acc:.4f}",
+                                      f"\tte_R^2: {te_R2:.4f}")
+                                
+                                # Save attention (mean over heads & batches)
+                                attn_mean_layers, attn_meta = compute_mean_attention_over_loader(model, test_dataloader, devices, mode=args.mode)
+                                attn_path = save_dir / f"Attn_{modelname}_{CV_cnt}_{type_idx}_{args.mode}_{args.output_activation}_fb{args.fbank_n}.mat"
+                                io.savemat(str(attn_path), {
+                                    "attn_mean_layers": attn_mean_layers,  # (L,S,S)
+                                    "attn_L": attn_mean_layers.shape[0],
+                                    "attn_S": attn_mean_layers.shape[1],
+                                    "mode": args.mode
+                                })
+                                
+                                baseprefix = f"Attn_{modelname}_{CV_cnt}_{type_idx}_{args.mode}_{args.output_activation}_fb{args.fbank_n}"
+                                save_per_token_importance(save_dir, baseprefix, attn_mean_layers, attn_meta, model_kwargs, T=int(X_train.shape[2]))
+                                
+                                savedict = {
+                                    'train_loss': tr_loss,
+                                    'train_pred': tr_pred,
+                                    'train_true': tr_true,
+                                    'train_rmse': tr_acc,
+                                    'train_R': tr_R2,
+                                    
+                                    'val_loss': val_loss,
+                                    'val_pred': val_pred,
+                                    'val_true': val_true,
+                                    'val_rmse': val_acc,
+                                    'val_R': val_R2,
+                                    
+                                    'test_loss': te_loss,
+                                    'test_pred': te_pred,
+                                    'test_true': te_true,
+                                    'test_rmse': te_acc,
+                                    'test_R': te_R2
+                                }
+                                
                                 history.loc[len(history)] = [
-                                    epoch + 1,
+                                    epoch + 2,
                                     tr_loss,
                                     val_loss,
                                     tr_acc,
                                     val_acc,
                                     model_updated,
-                                    0,
-                                    0
+                                    te_loss,
+                                    te_acc            
                                 ]
-                    
-                                early_stopper(val_loss)
-                                if early_stopper.early_stop:
-                                    print("Early stopping triggered at epoch", epoch + 1)
-                                    break
-                    
-                            ckpt_path = save_dir / f"Best_{modelname}_{CV_cnt}_{type_idx}_{args.mode}_{args.output_activation}_share.pt"
-                            torch.save({"state_dict": best_model_state, "model_kwargs": model_kwargs}, ckpt_path)
-
-                            del model
-                            model = TactileRoughnessHybridNet(**model_kwargs).to(devices)
-                            model.load_state_dict({k: v.to(devices) for k, v in best_model_state.items()})
-                                        
-                            tr_loss, tr_pred, tr_acc, tr_true, tr_R2 = validation(
-                                model, train_dataloader)
-                            val_loss, val_pred, val_acc, val_true, val_R2 = validation(
-                                model, val_dataloader)
-                            te_loss, te_pred, te_acc, te_true, te_R2 = validation(
-                                model, test_dataloader)
-                            torch.cuda.empty_cache()
-                            
-                            print( f"\ttr_loss: {tr_loss:.4f}",
-                                  f"\ttr_rmse: {tr_acc:.4f}",
-                                  f"\ttr_R^2: {tr_R2:.4f}")
-                            
-                            print( f"\tval_loss: {val_loss:.4f}",
-                                  f"\tval_rmse: {val_acc:.4f}",
-                                  f"\tval_R^2: {val_R2:.4f}")
-                            
-                            print( f"\tte_loss: {te_loss:.4f}",
-                                  f"\tte_rmse: {te_acc:.4f}",
-                                  f"\tte_R^2: {te_R2:.4f}")
-                            """
-                            # Save attention (mean over heads & batches)
-                            attn_mean_layers, attn_meta = compute_mean_attention_over_loader(model, test_dataloader, devices, mode=args.mode)
-                            attn_path = save_dir / f"Attn_{modelname}_{CV_cnt}_{type_idx}_{args.mode}_{args.output_activation}_bat128.mat"
-                            io.savemat(str(attn_path), {
-                                "attn_mean_layers": attn_mean_layers,  # (L,S,S)
-                                "attn_L": attn_mean_layers.shape[0],
-                                "attn_S": attn_mean_layers.shape[1],
-                                "mode": args.mode
-                            })
-                            
-                            baseprefix = f"Attn_{modelname}_{CV_cnt}_{type_idx}_{args.mode}_{args.output_activation}_bat128"
-                            save_per_token_importance(save_dir, baseprefix, attn_mean_layers, attn_meta, model_kwargs, T=int(X_train.shape[2]))
-                            """
-                            savedict = {
-                                'train_loss': tr_loss,
-                                'train_pred': tr_pred,
-                                'train_true': tr_true,
-                                'train_rmse': tr_acc,
-                                'train_R': tr_R2,
                                 
-                                'val_loss': val_loss,
-                                'val_pred': val_pred,
-                                'val_true': val_true,
-                                'val_rmse': val_acc,
-                                'val_R': val_R2,
-                                
-                                'test_loss': te_loss,
-                                'test_pred': te_pred,
-                                'test_true': te_true,
-                                'test_rmse': te_acc,
-                                'test_R': te_R2
-                            }
-                            
-                            history.loc[len(history)] = [
-                                epoch + 2,
-                                tr_loss,
-                                val_loss,
-                                tr_acc,
-                                val_acc,
-                                model_updated,
-                                te_loss,
-                                te_acc            
-                            ]
-                            
-                            hist_path = save_dir / f'History_{modelname}_{CV_cnt}_{type_idx}_{args.mode}_{args.output_activation}_share.csv'
-                            reg_path  = save_dir / f'Reg_{modelname}_{CV_cnt}_{type_idx}_{args.mode}_{args.output_activation}_share.mat'
-                            history.to_csv(hist_path, index=False)
-                            io.savemat(str(reg_path), savedict)
-                            del history, savedict
-                            print("\tSavedir", save_dir)
-                            CV_cnt = CV_cnt+1
+                                hist_path = save_dir / f'History_{modelname}_{CV_cnt}_{type_idx}_{args.mode}_{args.output_activation}_fb{args.fbank_n}.csv'
+                                reg_path  = save_dir / f'Reg_{modelname}_{CV_cnt}_{type_idx}_{args.mode}_{args.output_activation}_{args.fbank_n}.mat'
+                                history.to_csv(hist_path, index=False)
+                                io.savemat(str(reg_path), savedict)
+                                del history, savedict
+                                print("\tSavedir", save_dir)
+                                CV_cnt = CV_cnt+1
     
 if __name__ == '__main__':
 
